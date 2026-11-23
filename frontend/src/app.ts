@@ -1,8 +1,8 @@
-import { Component, inject, signal } from '@angular/core';
+import { Component, computed, inject, signal } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { Api } from './api';
-import { Comment, Context, Project, Task, TaskDetail, TaskStatus } from './models';
+import { AttentionTask, Comment, Context, Project, Task, TaskDetail, TaskStatus } from './models';
 
 @Component({
   selector: 'app-root',
@@ -17,6 +17,14 @@ export class AppComponent {
   project = signal<Project | null>(null);
   tasks = signal<Task[]>([]);
   detail = signal<TaskDetail | null>(null);
+  attention = signal<AttentionTask[]>([]);
+  detailProject = computed(() => {
+    const task = this.detail();
+    return task ? this.projects().find(p => p.id === task.project_id) : this.project();
+  });
+  attentionGroups = computed(() => ['Заблокированные', 'Просроченные', 'Срок в ближайшие 72 часа']
+    .map((label, index) => ({ label, tasks: this.attention().filter(task => task.priority === index + 1) }))
+    .filter(group => group.tasks.length > 0));
   loading = signal(false);
   saving = signal(false);
   error = signal('');
@@ -41,14 +49,14 @@ export class AppComponent {
     this.error.set('');
     this.closeDetail();
     try {
-      const [context, projects] = await Promise.all([
+      const [context, projects, attention] = await Promise.all([
         this.api.request<Context>('/context'), this.api.request<Project[]>('/projects'),
+        this.api.request<AttentionTask[]>('/attention'),
       ]);
       if (generation !== this.generation) return;
       this.context.set(context);
       this.projects.set(projects);
-      const project = projects.find(p => p.id === this.project()?.id) ?? projects[0];
-      if (project) await this.selectProject(project);
+      this.attention.set(attention);
     } catch (error) {
       if (generation === this.generation) this.fail(error);
     } finally {
@@ -61,9 +69,28 @@ export class AppComponent {
     this.project.set(null);
     this.projects.set([]);
     this.tasks.set([]);
+    this.attention.set([]);
     this.context.set(null);
     this.notice.set('');
     void this.load();
+  }
+
+  showAttention(): void {
+    this.project.set(null);
+    this.attention.set([]);
+    this.notice.set('');
+    void this.load();
+  }
+
+  private async refreshAttention(): Promise<void> {
+    if (this.project()) return;
+    const generation = this.generation;
+    try {
+      const tasks = await this.api.request<AttentionTask[]>('/attention');
+      if (generation === this.generation) this.attention.set(tasks);
+    } catch (error) {
+      if (generation === this.generation) this.fail(error);
+    }
   }
 
   async selectProject(project: Project): Promise<void> {
@@ -125,9 +152,9 @@ export class AppComponent {
   }
 
   async saveTask(): Promise<void> {
-    const project = this.project();
-    if (!project || this.saving()) return;
-    const userId = this.api.userId;
+    const project = this.detailProject();
+    if (!project || project.archived || this.saving()) return;
+    const viewGeneration = this.generation;
     const generation = this.detailGeneration;
     const existing = this.detail();
     this.saving.set(true);
@@ -139,9 +166,11 @@ export class AppComponent {
         ...(existing ? { version: existing.version } : {}),
       };
       const task = await this.api.request<Task>(existing ? `/tasks/${existing.id}` : `/projects/${project.id}/tasks`, existing ? 'PATCH' : 'POST', data);
-      if (userId !== this.api.userId || this.project()?.id !== project.id) return;
+      if (viewGeneration !== this.generation) return;
       if (!existing) this.projects.update(list => list.map(p => p.id === project.id ? { ...p, task_count: p.task_count + 1 } : p));
-      this.tasks.update(list => existing ? list.map(t => t.id === task.id ? task : t) : [...list, task]);
+      if (this.project()?.id === project.id) {
+        this.tasks.update(list => existing ? list.map(t => t.id === task.id ? task : t) : [...list, task]);
+      }
       if (generation === this.detailGeneration) {
         // Saving fields must not erase a comment the user has not sent yet.
         this.detail.set({ ...task, comments: existing?.comments ?? [] });
@@ -152,23 +181,28 @@ export class AppComponent {
         };
         this.notice.set('Задача сохранена');
       }
+      await this.refreshAttention();
     } catch (error) { if (generation === this.detailGeneration) this.fail(error); }
     finally { this.saving.set(false); }
   }
 
   async addComment(): Promise<void> {
     const task = this.detail();
-    if (!task || this.saving()) return;
+    if (!task || this.detailProject()?.archived || this.saving()) return;
+    const viewGeneration = this.generation;
     const generation = this.detailGeneration;
     this.saving.set(true);
     this.error.set('');
     try {
       const comment = await this.api.request<Comment>(`/tasks/${task.id}/comments`, 'POST', { body: this.comment });
-      if (generation !== this.detailGeneration) return;
-      // Refresh only the discussion: fields may contain unsaved user edits.
-      this.detail.update(current => current ? { ...current, comments: [...current.comments, comment] } : current);
-      this.comment = '';
-      this.notice.set('Комментарий добавлен');
+      if (viewGeneration !== this.generation) return;
+      if (generation === this.detailGeneration) {
+        // Refresh only the discussion: fields may contain unsaved user edits.
+        this.detail.update(current => current ? { ...current, comments: [...current.comments, comment] } : current);
+        this.comment = '';
+        this.notice.set('Комментарий добавлен');
+      }
+      await this.refreshAttention();
     } catch (error) { if (generation === this.detailGeneration) this.fail(error); }
     finally { this.saving.set(false); }
   }
