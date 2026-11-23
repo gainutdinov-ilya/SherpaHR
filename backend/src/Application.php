@@ -7,7 +7,7 @@ final class Application
 {
     private int $userId = 1;
 
-    public function __construct(private PDO $db) {}
+    public function __construct(private PDO $db, private ?int $attentionNow = null) {}
 
     public function run(): void
     {
@@ -58,10 +58,36 @@ final class Application
             $this->respond($projects);
             return;
         }
+        if ($method === 'GET' && $path === '/api/attention') {
+            $now = $this->attentionNow ?? time();
+            $tasks = $this->all(
+                "WITH ranked AS (
+                    SELECT t.*, p.name AS project_name, CASE
+                        WHEN t.status='blocked' THEN 1
+                        WHEN t.due_at < ? THEN 2
+                        WHEN t.due_at <= ? THEN 3
+                    END AS priority
+                    FROM tasks t
+                    JOIN projects p ON p.id=t.project_id
+                    JOIN project_members m ON m.project_id=p.id
+                    WHERE m.user_id=? AND p.archived=0 AND t.status<>'done'
+                )
+                SELECT * FROM ranked WHERE priority IS NOT NULL
+                ORDER BY priority, due_at IS NULL, due_at, id",
+                [gmdate('Y-m-d\TH:i:s\Z', $now), gmdate('Y-m-d\TH:i:s\Z', $now + 72 * 3600), $this->userId]
+            );
+            foreach ($tasks as &$task) {
+                $task['recent_comments'] = $task['priority'] === 1
+                    ? $this->all('SELECT c.*, u.name AS author FROM comments c JOIN users u ON u.id=c.user_id WHERE c.task_id=? ORDER BY c.id DESC LIMIT 2', [$task['id']])
+                    : [];
+            }
+            $this->respond($tasks);
+            return;
+        }
         if (preg_match('#^/api/projects/(\d+)/tasks$#', $path, $match)) {
             $project = $this->project((int) $match[1]);
             if ($method === 'GET') {
-                $this->respond($this->all('SELECT t.* FROM tasks t JOIN users u ON u.id=t.assignee_id WHERE t.project_id=? ORDER BY t.id', [$project['id']]));
+                $this->respond($this->all('SELECT * FROM tasks WHERE project_id=? ORDER BY id', [$project['id']]));
                 return;
             }
             if ($method === 'POST') {
@@ -102,8 +128,11 @@ final class Application
             $task = $this->task((int) $match[1]);
             $this->writable($this->project($task['project_id']));
             $data = $this->input();
-            $this->text($data['body'] ?? null, 'Комментарий', 5000, true);
-            throw new ApiError('Добавление комментариев пока не реализовано', 501);
+            $body = $this->text($data['body'] ?? null, 'Комментарий', 5000, true);
+            $stmt = $this->db->prepare('INSERT INTO comments (task_id,user_id,body,created_at) VALUES (?,?,?,?)');
+            $stmt->execute([$task['id'], $this->userId, $body, gmdate('Y-m-d\TH:i:s\Z')]);
+            $this->respond($this->one('SELECT c.*, u.name AS author FROM comments c JOIN users u ON u.id=c.user_id WHERE c.id=?', [(int) $this->db->lastInsertId()]), 201);
+            return;
         }
         throw new ApiError('Маршрут не найден', 404);
     }

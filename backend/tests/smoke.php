@@ -18,7 +18,11 @@ $base = 'http://' . $address;
 $environment = getenv();
 $environment['DB_PATH'] = $directory . '/test.sqlite';
 $environment['SEED_NOW'] = '2026-11-11T08:00:00Z';
-$process = proc_open([PHP_BINARY, '-S', $address, __DIR__ . '/../router.php'],
+$router = $directory . '/router.php';
+file_put_contents($router, '<?php require ' . var_export(__DIR__ . '/../src/Database.php', true)
+    . '; require ' . var_export(__DIR__ . '/../src/Application.php', true)
+    . '; (new Application(Database::connect(), strtotime("2026-11-11T08:00:00Z")))->run();');
+$process = proc_open([PHP_BINARY, '-S', $address, $router],
     [0 => ['pipe', 'r'], 1 => ['file', $directory . '/server.log', 'a'], 2 => ['file', $directory . '/server.log', 'a']],
     $pipes, dirname(__DIR__, 2), $environment);
 if (!is_resource($process)) {
@@ -109,8 +113,44 @@ try {
     [$status, $response] = request('GET', '/api/tasks/' . $task['id']);
     check($response['data']['status'] === 'done' && count($response['data']['comments']) === 1, 'changes persist across requests');
     check($response['data']['comments'][0]['body'] === '<script>window.pwned=1</script>', 'comment content retained as plain data');
+    [$status, $response] = request('GET', '/api/attention');
+    check($status === 200 && array_column($response['data'], 'id') === [5, 1, 2, 6], 'attention aggregates active projects in priority order; archive and done are excluded');
+    check(array_column($response['data'], 'priority') === [1, 1, 2, 3], 'overdue blocked task appears only once; 72-hour boundary is included');
+    check($response['data'][1]['description'] !== '' && count($response['data'][1]['recent_comments']) === 2
+        && $response['data'][2]['recent_comments'] === [], 'blocked tasks include context and other tasks omit discussion previews');
+    [$status, $response] = request('GET', '/api/attention', null, 3);
+    check($status === 200 && array_column($response['data'], 'id') === [11, 1, 2], 'attention is scoped to the acting user memberships');
+    check(request('GET', '/api/attention', null, 999)[0] === 401, 'attention rejects unknown persona');
+    foreach ([
+        ['2026-11-11T07:59:59Z', 'open'],
+        ['2026-11-11T08:00:00Z', 'open'],
+        ['2026-11-14T08:00:00Z', 'open'],
+        ['2026-11-14T08:00:01Z', 'open'],
+        [null, 'blocked'],
+    ] as [$due, $taskStatus]) {
+        [$status, $response] = request('POST', '/api/projects/3/tasks', [
+            'title' => 'Attention fixture', 'due_at' => $due, 'status' => $taskStatus,
+        ]);
+        check($status === 201, 'attention fixture created');
+        $fixtureIds[] = $response['data']['id'];
+    }
+    [$overdue, $dueNow, $atBoundary, $outside, $undated] = $fixtureIds;
+    [$status, $response] = request('GET', '/api/attention');
+    check(array_column($response['data'], 'id') === [5, 1, $undated, 2, $overdue, $dueNow, 6, $atBoundary],
+        'attention handles missing assignee and deadline, exact boundaries and tied deadlines');
+    [$status, $response] = request('POST', '/api/tasks/1/comments', ['body' => 'Newest preview'], 2);
+    check($status === 201, 'new blocked-task comment persisted');
+    $newCommentId = $response['data']['id'];
+    [$status, $response] = request('GET', '/api/attention');
+    $preview = $response['data'][1]['recent_comments'];
+    check(count($preview) === 2 && $preview[0]['id'] === $newCommentId && $preview[1]['id'] < $newCommentId, 'preview includes only the newest two comments in reverse order');
+    [$status, $response] = request('GET', '/api/tasks/1');
+    check(count($response['data']['comments']) === 3, 'full discussion remains available');
     [$status, $response] = request('GET', '/api/projects/1/tasks');
     check(count($response['data']) === 6, 'initialization does not duplicate or reset data');
+    $listedTasks = array_column($response['data'], null, 'id');
+    check($status === 200 && isset($listedTasks[$task['id']]) && $listedTasks[$task['id']]['assignee_id'] === null,
+        'project list includes the task after its assignee is cleared');
     check(request('GET', '/api/tasks/9999')[0] === 404, 'missing task returns 404');
     check(request('GET', '/api/unknown')[0] === 404, 'unknown route returns 404');
     echo "PASS: $count API checks\n";
